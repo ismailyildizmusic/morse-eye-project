@@ -1,6 +1,6 @@
 # MORSE-EYE — Eye Gaze to Morse (Streamlit + WebRTC + MediaPipe)
 # TÜBİTAK 2204-A için demo/prototip
-# Varsayılan: SAĞ = NOKTA (.) , SOL = ÇİZGİ (-)
+# Düzeltilmiş ve iyileştirilmiş versiyon
 
 import time
 import threading
@@ -46,14 +46,26 @@ class SharedState:
     last_dir: str = "CENTER"
     last_symbol: str = ""
     last_event: str = ""
+    
+    # Gaze ratio (debug için)
+    current_gaze_ratio: float = 0.5
+    
+    # EAR değeri (debug için)
+    current_ear: float = 0.25
 
-    blink_count_window: deque = field(default_factory=deque)  # timestamps
+    # Blink için state machine
+    eye_closed: bool = False
+    blink_count: int = 0
     last_blink_ts: float = 0.0
+    blink_sequence_start: float = 0.0
 
     # Kalibrasyon / eşik
     center_ratio: float = 0.5
     ratio_left: float = 0.40
     ratio_right: float = 0.60
+    
+    # EAR eşiği (göz kırpma için)
+    ear_threshold: float = 0.21
 
     # hız/kararlılık
     hold_start_ts: float = 0.0
@@ -61,7 +73,11 @@ class SharedState:
     last_symbol_ts: float = 0.0
 
 
-STATE = SharedState()
+# Global state - uygulama başladığında bir kere oluşturulur
+if "morse_state" not in st.session_state:
+    st.session_state.morse_state = SharedState()
+
+STATE = st.session_state.morse_state
 
 
 # -----------------------------
@@ -80,12 +96,12 @@ def decode_morse(m: str) -> str:
 
 
 def speak_in_browser(text: str):
-    # Tarayıcıda SpeechSynthesis ile seslendirir (server bağımsız)
-    safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    """Tarayıcıda SpeechSynthesis ile seslendirir"""
+    safe = text.replace("\\", "\\\\").replace('"', '\\"')
     components.html(
         f"""
         <script>
-        const msg = new SpeechSynthesisUtterance(`{safe}`);
+        const msg = new SpeechSynthesisUtterance("{safe}");
         msg.lang = "tr-TR";
         msg.rate = 1.0;
         window.speechSynthesis.cancel();
@@ -105,34 +121,42 @@ class MorseEyeProcessor(VideoProcessorBase):
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
-            refine_landmarks=True,  # iris noktaları için önemli
+            refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
 
-        # Blink tespiti için eşik (panelden ayarlanabilir)
-        self.ear_thresh = 0.20
-        self.blink_min_interval = 0.25  # saniye
-        self.blink_window = 1.2         # 2-3-5 kırpma komut penceresi
+        # Blink tespiti için parametreler
+        self.blink_min_interval = 0.15      # İki blink arası minimum süre
+        self.blink_sequence_timeout = 1.5   # Blink serisinin zaman aşımı
+        self.blink_confirm_delay = 0.7      # Seri bittikten sonra bekleme
 
         # Sembol eklemek için bakışı sabit tutma
-        self.dwell_time = 0.35          # saniye (sağ/solu bu kadar tutunca 1 sembol ekler)
-        self.symbol_cooldown = 0.55     # saniye
+        self.dwell_time = 0.40              # saniye
+        self.symbol_cooldown = 0.50         # saniye
 
-        # Yukarı/aşağı komutları (opsiyonel)
-        self.enable_updown = False
-        self.updown_hold = 1.8
-
-        # yön filtresi
+        # Yön filtresi (smooth için)
         self.ratio_smooth = deque(maxlen=5)
+        
+        # Önceki EAR değeri (geçiş algılama için)
+        self._prev_ear = 0.25
+        self._eye_was_closed = False
 
-        # göz landmark indeksleri (MediaPipe FaceMesh)
-        self.LEFT_CORNER = (33, 133)
-        self.RIGHT_CORNER = (362, 263)
-        self.LEFT_LID = (159, 145)
-        self.RIGHT_LID = (386, 374)
+        # Göz landmark indeksleri (MediaPipe FaceMesh 468+10 iris)
+        # Sol göz köşeleri
+        self.LEFT_EYE_LEFT = 33      # Sol gözün sol köşesi
+        self.LEFT_EYE_RIGHT = 133    # Sol gözün sağ köşesi
+        # Sağ göz köşeleri  
+        self.RIGHT_EYE_LEFT = 362    # Sağ gözün sol köşesi
+        self.RIGHT_EYE_RIGHT = 263   # Sağ gözün sağ köşesi
+        
+        # Göz kapağı (EAR hesabı için)
+        self.LEFT_EYE_TOP = 159
+        self.LEFT_EYE_BOTTOM = 145
+        self.RIGHT_EYE_TOP = 386
+        self.RIGHT_EYE_BOTTOM = 374
 
-        # iris indeksleri (refine_landmarks=True ile)
+        # İris indeksleri (refine_landmarks=True ile aktif)
         self.LEFT_IRIS = [474, 475, 476, 477]
         self.RIGHT_IRIS = [469, 470, 471, 472]
 
@@ -147,148 +171,210 @@ class MorseEyeProcessor(VideoProcessorBase):
         return (float(np.mean(xs)), float(np.mean(ys)))
 
     def _gaze_ratio(self, lm, w, h):
-        # göz köşeleri
-        lx1, ly1 = self._landmark_xy(lm, w, h, self.LEFT_CORNER[0])
-        lx2, ly2 = self._landmark_xy(lm, w, h, self.LEFT_CORNER[1])
-        rx1, ry1 = self._landmark_xy(lm, w, h, self.RIGHT_CORNER[0])
-        rx2, ry2 = self._landmark_xy(lm, w, h, self.RIGHT_CORNER[1])
+        """
+        Gaze ratio hesaplar: 0.0 = tam sol, 1.0 = tam sağ, 0.5 = orta
+        """
+        # Sol göz köşeleri
+        left_eye_left = self._landmark_xy(lm, w, h, self.LEFT_EYE_LEFT)
+        left_eye_right = self._landmark_xy(lm, w, h, self.LEFT_EYE_RIGHT)
+        
+        # Sağ göz köşeleri
+        right_eye_left = self._landmark_xy(lm, w, h, self.RIGHT_EYE_LEFT)
+        right_eye_right = self._landmark_xy(lm, w, h, self.RIGHT_EYE_RIGHT)
 
-        # iris merkezleri
+        # İris merkezleri
         try:
-            lcx, lcy = self._iris_center(lm, w, h, self.LEFT_IRIS)
-            rcx, rcy = self._iris_center(lm, w, h, self.RIGHT_IRIS)
+            left_iris = self._iris_center(lm, w, h, self.LEFT_IRIS)
+            right_iris = self._iris_center(lm, w, h, self.RIGHT_IRIS)
         except Exception:
-            # fallback: köşelerin orta noktası (zayıf ama crash olmaz)
-            lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
-            rcx, rcy = (rx1 + rx2) / 2, (ry1 + ry2) / 2
+            # Fallback
+            left_iris = ((left_eye_left[0] + left_eye_right[0]) / 2,
+                        (left_eye_left[1] + left_eye_right[1]) / 2)
+            right_iris = ((right_eye_left[0] + right_eye_right[0]) / 2,
+                         (right_eye_left[1] + right_eye_right[1]) / 2)
 
-        # ratio: iris_x, gözün sol köşesine ne kadar yakın?
-        lden = max(1.0, (lx2 - lx1))
-        rden = max(1.0, (rx2 - rx1))
-        lr = (lcx - lx1) / lden
-        rr = (rcx - rx1) / rden
+        # Her göz için iris'in göz genişliği içindeki pozisyonunu hesapla
+        left_eye_width = abs(left_eye_right[0] - left_eye_left[0])
+        right_eye_width = abs(right_eye_right[0] - right_eye_left[0])
+        
+        if left_eye_width < 1:
+            left_eye_width = 1
+        if right_eye_width < 1:
+            right_eye_width = 1
 
-        ratio = float((lr + rr) / 2.0)
+        # İris'in göz içindeki yatay pozisyonu (0-1 arası)
+        left_ratio = (left_iris[0] - left_eye_left[0]) / left_eye_width
+        right_ratio = (right_iris[0] - right_eye_left[0]) / right_eye_width
+
+        # İki gözün ortalaması
+        ratio = (left_ratio + right_ratio) / 2.0
         ratio = clamp(ratio, 0.0, 1.0)
-        return ratio, (lcx, lcy), (rcx, rcy), (lx1, ly1, lx2, ly2), (rx1, ry1, rx2, ry2)
+
+        return ratio, left_iris, right_iris, \
+               (left_eye_left, left_eye_right), (right_eye_left, right_eye_right)
 
     def _eye_aspect_ratio(self, lm, w, h):
-        # basit EAR: dikey / yatay (iki göz ortalaması)
-        # sol
-        l_up = self._landmark_xy(lm, w, h, self.LEFT_LID[0])
-        l_dn = self._landmark_xy(lm, w, h, self.LEFT_LID[1])
-        l_c1 = self._landmark_xy(lm, w, h, self.LEFT_CORNER[0])
-        l_c2 = self._landmark_xy(lm, w, h, self.LEFT_CORNER[1])
-        # sağ
-        r_up = self._landmark_xy(lm, w, h, self.RIGHT_LID[0])
-        r_dn = self._landmark_xy(lm, w, h, self.RIGHT_LID[1])
-        r_c1 = self._landmark_xy(lm, w, h, self.RIGHT_CORNER[0])
-        r_c2 = self._landmark_xy(lm, w, h, self.RIGHT_CORNER[1])
+        """
+        Eye Aspect Ratio (EAR) hesaplar.
+        Düşük değer = göz kapalı, yüksek değer = göz açık
+        """
+        # Sol göz
+        left_top = self._landmark_xy(lm, w, h, self.LEFT_EYE_TOP)
+        left_bottom = self._landmark_xy(lm, w, h, self.LEFT_EYE_BOTTOM)
+        left_left = self._landmark_xy(lm, w, h, self.LEFT_EYE_LEFT)
+        left_right = self._landmark_xy(lm, w, h, self.LEFT_EYE_RIGHT)
+        
+        # Sağ göz
+        right_top = self._landmark_xy(lm, w, h, self.RIGHT_EYE_TOP)
+        right_bottom = self._landmark_xy(lm, w, h, self.RIGHT_EYE_BOTTOM)
+        right_left = self._landmark_xy(lm, w, h, self.RIGHT_EYE_LEFT)
+        right_right = self._landmark_xy(lm, w, h, self.RIGHT_EYE_RIGHT)
 
-        l_v = _dist(l_up, l_dn)
-        l_h = _dist(l_c1, l_c2)
-        r_v = _dist(r_up, r_dn)
-        r_h = _dist(r_c1, r_c2)
+        # EAR = dikey mesafe / yatay mesafe
+        left_vertical = _dist(left_top, left_bottom)
+        left_horizontal = _dist(left_left, left_right)
+        right_vertical = _dist(right_top, right_bottom)
+        right_horizontal = _dist(right_left, right_right)
 
-        l_ear = l_v / (l_h + 1e-9)
-        r_ear = r_v / (r_h + 1e-9)
-        return float((l_ear + r_ear) / 2.0)
+        left_ear = left_vertical / (left_horizontal + 1e-6)
+        right_ear = right_vertical / (right_horizontal + 1e-6)
 
-    def _register_blink(self):
+        return (left_ear + right_ear) / 2.0
+
+    def _process_blink(self, ear: float):
+        """
+        Göz kırpma algılama - state machine yaklaşımı
+        """
         now = time.time()
+        
         with STATE.lock:
-            # debounce
-            if now - STATE.last_blink_ts < self.blink_min_interval:
-                return
-            STATE.last_blink_ts = now
-            STATE.blink_count_window.append(now)
-            # pencere dışını at
-            while STATE.blink_count_window and (now - STATE.blink_count_window[0] > self.blink_window):
-                STATE.blink_count_window.popleft()
+            ear_threshold = STATE.ear_threshold
+        
+        # Göz kapalı mı?
+        eye_is_closed = ear < ear_threshold
+        
+        # Geçiş algılama: kapalıdan açığa geçiş = 1 blink
+        if self._eye_was_closed and not eye_is_closed:
+            # Göz açıldı = blink tamamlandı
+            with STATE.lock:
+                time_since_last = now - STATE.last_blink_ts
+                
+                if time_since_last > self.blink_min_interval:
+                    # Yeni bir blink
+                    if STATE.blink_count == 0:
+                        # Yeni seri başlıyor
+                        STATE.blink_sequence_start = now
+                    
+                    STATE.blink_count += 1
+                    STATE.last_blink_ts = now
+                    STATE.last_event = f"Blink #{STATE.blink_count} algılandı"
+        
+        self._eye_was_closed = eye_is_closed
 
-    def _interpret_blinks_if_ready(self):
-        # Son kırpmanın üzerinden biraz zaman geçtiyse komut üret
+    def _check_blink_command(self):
+        """
+        Blink serisini değerlendir ve komut üret
+        """
         now = time.time()
+        
         with STATE.lock:
-            if not STATE.blink_count_window:
+            if STATE.blink_count == 0:
                 return None
-            last = STATE.blink_count_window[-1]
-            if now - last < 0.55:  # hala seri kırpma geliyor olabilir
-                return None
-            count = len(STATE.blink_count_window)
-            STATE.blink_count_window.clear()
-
-        # Komutlar:
-        # 5 kırpma: başlat/durdur
-        # 2 kırpma: harf onayla
-        # 3 kırpma: boşluk
-        if count >= 5:
-            return "TOGGLE_ACTIVE"
-        if count == 2:
-            return "CONFIRM_CHAR"
-        if count == 3:
-            return "SPACE"
+            
+            time_since_last = now - STATE.last_blink_ts
+            
+            # Seri bitti mi? (son blink'ten bu yana yeterli süre geçti mi?)
+            if time_since_last >= self.blink_confirm_delay:
+                count = STATE.blink_count
+                STATE.blink_count = 0
+                STATE.blink_sequence_start = 0
+                
+                # Komut yorumlama
+                if count >= 5:
+                    return "TOGGLE_ACTIVE"
+                elif count == 3:
+                    return "SPACE"
+                elif count == 2:
+                    return "CONFIRM_CHAR"
+                else:
+                    # 1 veya 4 blink - bir şey yapma
+                    return None
+            
+            # Zaman aşımı kontrolü
+            if STATE.blink_sequence_start > 0:
+                if now - STATE.blink_sequence_start > self.blink_sequence_timeout:
+                    # Seri zaman aşımına uğradı, sıfırla
+                    STATE.blink_count = 0
+                    STATE.blink_sequence_start = 0
+        
         return None
 
-    def _update_logic(self, direction: str, mapping_right_dot: bool):
-        now = time.time()
-
-        # blink komutu var mı?
-        cmd = self._interpret_blinks_if_ready()
-        if cmd:
-            with STATE.lock:
-                if cmd == "TOGGLE_ACTIVE":
-                    STATE.active = not STATE.active
-                    STATE.last_event = "Sistem " + ("AKTİF ✅" if STATE.active else "PASİF ⛔")
-                    STATE.morse = "" if not STATE.active else STATE.morse
-
-                elif cmd == "CONFIRM_CHAR":
-                    if STATE.morse:
-                        ch = decode_morse(STATE.morse)
-                        STATE.text += ch
-                        STATE.last_event = f"Onay: {STATE.morse} → {ch}"
-                        STATE.morse = ""
-                    else:
-                        STATE.last_event = "Onay: boş (morse yok)"
-
-                elif cmd == "SPACE":
-                    STATE.text += " "
-                    STATE.last_event = "Boşluk eklendi"
-
+    def _execute_command(self, cmd: str):
+        """
+        Komutu çalıştır
+        """
+        if cmd is None:
             return
+            
+        with STATE.lock:
+            if cmd == "TOGGLE_ACTIVE":
+                STATE.active = not STATE.active
+                STATE.last_event = "Sistem " + ("AKTİF ✅" if STATE.active else "PASİF ⛔")
+                if not STATE.active:
+                    STATE.morse = ""
+                    
+            elif cmd == "CONFIRM_CHAR":
+                if STATE.morse:
+                    ch = decode_morse(STATE.morse)
+                    STATE.text += ch
+                    STATE.last_event = f"Harf eklendi: {STATE.morse} → {ch}"
+                    STATE.morse = ""
+                else:
+                    STATE.last_event = "Morse tamponu boş!"
+                    
+            elif cmd == "SPACE":
+                STATE.text += " "
+                STATE.last_event = "Boşluk eklendi"
 
-        # aktif değilse sadece yön bilgisini yazalım
+    def _update_gaze_logic(self, direction: str, mapping_right_dot: bool):
+        """
+        Bakış yönüne göre sembol ekleme
+        """
+        now = time.time()
+        
         with STATE.lock:
             STATE.last_dir = direction
-            active = STATE.active
-
-        if not active:
-            return
-
-        # sağ/sol ile sembol ekleme (dwell)
-        if direction in ("LEFT", "RIGHT"):
-            with STATE.lock:
+            
+            if not STATE.active:
+                return
+            
+            # Sağ/Sol bakışla sembol ekleme
+            if direction in ("LEFT", "RIGHT"):
                 if STATE.hold_dir != direction:
+                    # Yön değişti, timer sıfırla
                     STATE.hold_dir = direction
                     STATE.hold_start_ts = now
                 else:
-                    held = now - STATE.hold_start_ts
-                    can_add = (now - STATE.last_symbol_ts) > self.symbol_cooldown
-                    if held >= self.dwell_time and can_add:
-                        # mapping
+                    # Aynı yöne bakmaya devam
+                    held_time = now - STATE.hold_start_ts
+                    time_since_symbol = now - STATE.last_symbol_ts
+                    
+                    if held_time >= self.dwell_time and time_since_symbol > self.symbol_cooldown:
+                        # Sembol ekle
                         if mapping_right_dot:
                             sym = "." if direction == "RIGHT" else "-"
                         else:
-                            sym = "." if direction == "LEFT" else "-"
-
+                            sym = "-" if direction == "RIGHT" else "."
+                        
                         STATE.morse += sym
                         STATE.last_symbol = sym
                         STATE.last_symbol_ts = now
-                        STATE.last_event = f"Sembol eklendi: {sym}"
-                        # aynı bakışta tekrar eklemeyi zorlaştır
-                        STATE.hold_start_ts = now + 0.15
-        else:
-            with STATE.lock:
+                        STATE.last_event = f"Sembol: {sym} (Morse: {STATE.morse})"
+                        
+                        # Aynı bakışta sürekli eklemeyi önle
+                        STATE.hold_start_ts = now + 0.1
+            else:
+                # Ortaya bakıyor
                 STATE.hold_dir = direction
                 STATE.hold_start_ts = now
 
@@ -296,65 +382,72 @@ class MorseEyeProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
 
-        # parametreleri ana thread’den al (state)
+        # Parametreleri al
         with STATE.lock:
             ratio_left = STATE.ratio_left
             ratio_right = STATE.ratio_right
+            active = STATE.active
+            morse = STATE.morse
+            text = STATE.text
+            last_event = STATE.last_event
+            blink_count = STATE.blink_count
 
-        # UI ayarları session_state üzerinden (webrtc thread’inde erişmek riskli),
-        # bu yüzden eşikleri STATE üstünden yönetiyoruz.
-
+        # Yüz algılama
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         res = self.face_mesh.process(rgb)
 
         direction = "NO_FACE"
-        gaze_ratio = None
+        gaze_ratio = 0.5
+        ear = 0.25
 
         if res.multi_face_landmarks:
             lm = res.multi_face_landmarks[0].landmark
 
-            # gaze
-            gaze_ratio, l_iris, r_iris, l_c, r_c = self._gaze_ratio(lm, w, h)
-
+            # Gaze ratio hesapla
+            gaze_ratio, left_iris, right_iris, left_eye, right_eye = self._gaze_ratio(lm, w, h)
+            
+            # Smooth
             self.ratio_smooth.append(gaze_ratio)
-            g = float(np.mean(self.ratio_smooth))
+            smooth_ratio = float(np.mean(self.ratio_smooth))
 
-            if g < ratio_left:
-                direction = "LEFT"
-            elif g > ratio_right:
-                direction = "RIGHT"
+            # Yön belirleme
+            if smooth_ratio < ratio_left:
+                direction = "LEFT ◀"
+            elif smooth_ratio > ratio_right:
+                direction = "RIGHT ▶"
             else:
-                direction = "CENTER"
+                direction = "CENTER ●"
 
-            # blink
+            # EAR hesapla
             ear = self._eye_aspect_ratio(lm, w, h)
-            if ear < self.ear_thresh:
-                # göz kapalı say
-                pass
-            else:
-                # göz açık; kapanma-açılma geçişini burada yakalamak için
-                # basit yaklaşım: ear düşükten yükseğe çıktığında blink say
-                # (daha iyi için state tutulabilir; burada pratik tutuyoruz)
-                # EAR çok titreşirse yanlış sayabilir; eşik ve interval ile azaltıyoruz.
-                if hasattr(self, "_prev_ear") and self._prev_ear < self.ear_thresh:
-                    self._register_blink()
-                self._prev_ear = ear
+            
+            # State'e kaydet (debug için)
+            with STATE.lock:
+                STATE.current_gaze_ratio = smooth_ratio
+                STATE.current_ear = ear
 
-            # çizimler (göz köşeleri + iris)
-            (lx1, ly1, lx2, ly2) = l_c
-            (rx1, ry1, rx2, ry2) = r_c
-            cv2.circle(img, (int(l_iris[0]), int(l_iris[1])), 2, (255, 255, 0), -1)
-            cv2.circle(img, (int(r_iris[0]), int(r_iris[1])), 2, (255, 255, 0), -1)
-            cv2.line(img, (int(lx1), int(ly1)), (int(lx2), int(ly2)), (80, 80, 200), 1)
-            cv2.line(img, (int(rx1), int(ry1)), (int(rx2), int(ry2)), (80, 80, 200), 1)
+            # Blink işleme
+            self._process_blink(ear)
 
-        # mapping (varsayılan sağ=nokta)
-        mapping_right_dot = st.session_state.get("mapping_right_dot", True)
+            # Görselleştirme - iris noktaları
+            cv2.circle(img, (int(left_iris[0]), int(left_iris[1])), 3, (0, 255, 255), -1)
+            cv2.circle(img, (int(right_iris[0]), int(right_iris[1])), 3, (0, 255, 255), -1)
+            
+            # Göz çerçeveleri
+            cv2.line(img, (int(left_eye[0][0]), int(left_eye[0][1])), 
+                    (int(left_eye[1][0]), int(left_eye[1][1])), (255, 100, 100), 2)
+            cv2.line(img, (int(right_eye[0][0]), int(right_eye[0][1])), 
+                    (int(right_eye[1][0]), int(right_eye[1][1])), (255, 100, 100), 2)
 
-        # mantık güncelle
-        self._update_logic(direction, mapping_right_dot)
+        # Blink komutlarını kontrol et
+        cmd = self._check_blink_command()
+        self._execute_command(cmd)
 
-        # üst yazılar (overlay)
+        # Gaze mantığı
+        mapping_right_dot = True  # Varsayılan: sağ = nokta
+        self._update_gaze_logic(direction.split()[0] if direction != "NO_FACE" else "CENTER", mapping_right_dot)
+
+        # State'i tekrar al (güncellenmiş olabilir)
         with STATE.lock:
             active = STATE.active
             morse = STATE.morse
@@ -362,28 +455,54 @@ class MorseEyeProcessor(VideoProcessorBase):
             last_event = STATE.last_event
             last_symbol = STATE.last_symbol
 
-        # HUD
-        cv2.rectangle(img, (10, 10), (w - 10, 135), (255, 255, 255), -1)
-        cv2.rectangle(img, (10, 10), (w - 10, 135), (30, 41, 59), 2)
+        # =====================
+        # EKRAN ÜZERİ GÖSTERGE (HUD)
+        # =====================
+        
+        # Üst panel - arka plan
+        cv2.rectangle(img, (5, 5), (w - 5, 160), (255, 255, 255), -1)
+        cv2.rectangle(img, (5, 5), (w - 5, 160), (30, 41, 59), 2)
 
-        status = "AKTİF ✅" if active else "PASİF ⛔ (5 kırpma ile başlat)"
-        cv2.putText(img, f"MORSE-EYE | {status}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (30, 41, 59), 2)
+        # Başlık ve durum
+        status_text = "AKTIF" if active else "PASIF"
+        status_color = (0, 150, 0) if active else (0, 0, 200)
+        cv2.putText(img, f"MORSE-EYE | {status_text}", (15, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
-        if gaze_ratio is not None:
-            cv2.putText(img, f"Yon: {direction} | GazeRatio: {gaze_ratio:.3f}", (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 41, 59), 2)
-        else:
-            cv2.putText(img, f"Yon: {direction}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 41, 59), 2)
+        # Gaze bilgisi
+        cv2.putText(img, f"Yon: {direction} | Ratio: {gaze_ratio:.3f} | EAR: {ear:.3f}", 
+                   (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1)
 
-        cv2.putText(img, f"Morse: {morse}   (Son: {last_symbol})", (20, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 41, 59), 2)
-        cv2.putText(img, f"Mesaj: {text[-45:]}", (20, 127),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 41, 59), 2)
+        # Blink sayısı
+        cv2.putText(img, f"Blink Sayaci: {blink_count}", 
+                   (15, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 0, 100), 1)
 
-        # küçük event
+        # MORSE - BÜYÜK VE NET
+        morse_display = morse if morse else "---"
+        cv2.putText(img, f"MORSE: {morse_display}", (15, 105), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 50, 0), 2)
+        
+        # Anlık çözüm
+        current_char = decode_morse(morse) if morse else "-"
+        cv2.putText(img, f"Anlık Harf: {current_char}", (15, 130),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 0), 2)
+
+        # MESAJ - BÜYÜK
+        text_display = text[-30:] if text else "(bos)"
+        cv2.putText(img, f"MESAJ: {text_display}", (15, 155),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 150), 2)
+
+        # Alt bilgi - son olay
         if last_event:
-            cv2.putText(img, last_event[:60], (20, h - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 120, 0), 2)
+            cv2.rectangle(img, (5, h - 35), (w - 5, h - 5), (240, 255, 240), -1)
+            cv2.putText(img, last_event[:60], (15, h - 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 120, 0), 1)
+
+        # Aktif değilse uyarı
+        if not active:
+            cv2.rectangle(img, (w//2 - 180, h//2 - 25), (w//2 + 180, h//2 + 25), (0, 0, 200), -1)
+            cv2.putText(img, "5x KIRP veya BUTON ile AKTIF ET", (w//2 - 170, h//2 + 8),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         return frame.from_ndarray(img, format="bgr24")
 
@@ -393,8 +512,7 @@ class MorseEyeProcessor(VideoProcessorBase):
 # -----------------------------
 st.set_page_config(page_title="MORSE-EYE | TÜBİTAK 2204-A", page_icon="👁️", layout="wide")
 
-st.markdown(
-    """
+st.markdown("""
 <style>
 html, body, [data-testid="stAppViewContainer"] { background:#f8fafc; }
 .block-container { max-width: 1200px; padding-top: 1rem; }
@@ -412,96 +530,138 @@ html, body, [data-testid="stAppViewContainer"] { background:#f8fafc; }
   border: 1px solid rgba(255,255,255,0.18);
   font-size: 0.9rem;
 }
-.card { background:white; border:1px solid rgba(15,23,42,0.10);
-  border-radius: 14px; padding: 14px; box-shadow: 0 6px 16px rgba(15,23,42,0.06);
+.big-text {
+  font-size: 2rem;
+  font-weight: bold;
+  color: #1e3a5f;
+  padding: 10px;
+  background: #e8f4f8;
+  border-radius: 10px;
+  margin: 10px 0;
+}
+.morse-display {
+  font-size: 2.5rem;
+  font-family: monospace;
+  letter-spacing: 8px;
+  color: #c0392b;
+  padding: 15px;
+  background: #fdf2f2;
+  border-radius: 10px;
+  text-align: center;
 }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-st.markdown(
-    """
+st.markdown("""
 <div class="header">
   <h1 style="margin:0; font-weight:900;">👁️ MORSE-EYE — Göz Hareketleri ile Mors Kod İletişimi</h1>
-  <div class="badge">🏆 TÜBİTAK 2204-A • Demo Web App (GitHub + Streamlit)</div>
+  <div class="badge">🏆 TÜBİTAK 2204-A • Demo Web App</div>
   <p style="margin:10px 0 0 0; color:#cbd5e1;">
     Sağ/Sol bakış ile nokta-çizgi üret, kırpma komutlarıyla harfi onayla ve mesaj oluştur.
   </p>
 </div>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
 # --- Sidebar ayarları
 with st.sidebar:
     st.header("⚙️ Kontrol Paneli")
-
-    st.session_state["mapping_right_dot"] = st.toggle("Sağ = Nokta (.)  |  Sol = Çizgi (-)", value=True)
-    st.caption("İstersen tersine çevirip sol=nokta yapabilirsin.")
-
+    
+    # MANUEL AKTİF/PASİF BUTONU
+    st.subheader("🚀 Hızlı Başlat")
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("▶️ AKTİF ET", use_container_width=True, type="primary"):
+            with STATE.lock:
+                STATE.active = True
+                STATE.last_event = "Manuel olarak AKTİF edildi"
+    with col_btn2:
+        if st.button("⏹️ PASİF YAP", use_container_width=True):
+            with STATE.lock:
+                STATE.active = False
+                STATE.morse = ""
+                STATE.last_event = "Manuel olarak PASİF yapıldı"
+    
+    # Mevcut durum göstergesi
+    with STATE.lock:
+        is_active = STATE.active
+    if is_active:
+        st.success("✅ Sistem AKTİF - Bakışlarınız algılanıyor")
+    else:
+        st.warning("⛔ Sistem PASİF - Butona basın veya 5x göz kırpın")
+    
     st.divider()
-    st.subheader("🎯 Kalibrasyon / Eşik")
-    st.write("İpucu: Kameraya karşı **tam ortaya bak** ve ışığı sabitle.")
-
-    if st.button("📌 MERKEZ KALİBRASYONU AL (Ortaya bak)", use_container_width=True):
-        # o anki center_ratio'yu son ölçümden almak için:
-        # (güvenli yol: mevcut oranı sabit 0.5 yapıp, kullanıcıya eşikleri sliderla ayarlatmak)
-        with STATE.lock:
-            STATE.center_ratio = 0.5
-            # default eşikler (orta 0.5 çevresi)
-            STATE.ratio_left = 0.42
-            STATE.ratio_right = 0.58
-
-    left_thr = st.slider("Sol Eşik (ratio_left)", 0.20, 0.50, 0.42, 0.01)
-    right_thr = st.slider("Sağ Eşik (ratio_right)", 0.50, 0.80, 0.58, 0.01)
-
+    
+    # Mapping ayarı
+    mapping = st.toggle("Sağ = Nokta (.)  |  Sol = Çizgi (-)", value=True)
+    st.session_state["mapping_right_dot"] = mapping
+    
+    st.divider()
+    st.subheader("🎯 Kalibrasyon")
+    
+    # Eşik ayarları
+    left_thr = st.slider("Sol Eşik", 0.20, 0.50, 0.40, 0.01)
+    right_thr = st.slider("Sağ Eşik", 0.50, 0.80, 0.60, 0.01)
+    ear_thr = st.slider("EAR Eşiği (Göz Kırpma)", 0.10, 0.35, 0.21, 0.01, 
+                       help="Düşük = daha hassas kırpma algılama")
+    
     with STATE.lock:
         STATE.ratio_left = float(left_thr)
         STATE.ratio_right = float(right_thr)
-
+        STATE.ear_threshold = float(ear_thr)
+    
+    # Debug bilgileri
+    st.divider()
+    st.subheader("📊 Debug Bilgileri")
+    with STATE.lock:
+        st.write(f"**Gaze Ratio:** {STATE.current_gaze_ratio:.3f}")
+        st.write(f"**EAR:** {STATE.current_ear:.3f}")
+        st.write(f"**Blink Sayacı:** {STATE.blink_count}")
+        st.write(f"**Son Yön:** {STATE.last_dir}")
+    
     st.divider()
     st.subheader("⌨️ Komutlar")
-    st.markdown(
-        """
-- **5 kırpma**: sistemi Aç/Kapat  
-- **Sağ/Sol bak (0.35 sn)**: **Nokta / Çizgi** ekler  
+    st.markdown("""
+- **5 kırpma**: Sistemi Aç/Kapat  
+- **Sağ/Sol bak (0.4 sn)**: Nokta/Çizgi ekle  
 - **2 kırpma**: Harfi onayla  
 - **3 kırpma**: Boşluk ekle
-        """
-    )
+    """)
 
     st.divider()
     st.subheader("🗑️ Mesaj Kontrol")
     if st.button("↩️ Son karakteri sil", use_container_width=True):
         with STATE.lock:
             STATE.text = STATE.text[:-1]
-            STATE.last_event = "Silindi: son karakter"
+            STATE.last_event = "Son karakter silindi"
 
     if st.button("🧹 Morse tamponunu temizle", use_container_width=True):
         with STATE.lock:
             STATE.morse = ""
             STATE.last_event = "Morse temizlendi"
 
-    if st.button("🧾 Mesajı temizle", use_container_width=True):
+    if st.button("🧾 Tüm mesajı temizle", use_container_width=True):
         with STATE.lock:
             STATE.text = ""
-            STATE.last_event = "Mesaj temizlendi"
+            STATE.morse = ""
+            STATE.last_event = "Her şey temizlendi"
 
     st.divider()
-    st.subheader("🔊 Sesli Oku (Tarayıcı)")
+    st.subheader("🔊 Sesli Oku")
     if st.button("▶️ Mesajı seslendir", use_container_width=True):
         with STATE.lock:
             t = STATE.text.strip()
         if t:
             speak_in_browser(t)
+        else:
+            st.warning("Mesaj boş!")
+
 
 # --- Main layout
 col1, col2 = st.columns([2, 1], gap="large")
 
 with col1:
-    st.markdown("### 🎥 Kamera (Canlı) + Üstte Anlık Mors & Mesaj")
-    st.info("Not: İlk çalıştırmada tarayıcı kamera izni ister. Video üstündeki beyaz panelde durum ve mesajı görürsün.")
+    st.markdown("### 🎥 Kamera (Canlı)")
+    st.info("💡 Kamera izni verdikten sonra, önce **AKTİF ET** butonuna basın veya **5 kere göz kırpın**.")
 
     RTC_CONFIGURATION = RTCConfiguration(
         {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -518,29 +678,47 @@ with col1:
 
 with col2:
     st.markdown("### 📌 Çıktı Paneli")
+    
+    # Durumu göster
     with STATE.lock:
         active = STATE.active
         morse = STATE.morse
         text = STATE.text
         last_event = STATE.last_event
+        current_char = decode_morse(morse) if morse else ""
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.write("**Durum:**", "AKTİF ✅" if active else "PASİF ⛔ (5 kırpma)")
-    st.write("**Morse tamponu:**", f"`{morse}`")
-    st.write("**Anlık çözüm:**", decode_morse(morse) if morse else "-")
-    st.write("**Mesaj:**")
-    st.code(text if text else "—", language="text")
+    # Durum kartı
+    if active:
+        st.success("### ✅ SİSTEM AKTİF")
+    else:
+        st.error("### ⛔ SİSTEM PASİF")
+    
+    # Morse gösterimi - BÜYÜK
+    st.markdown("#### 📟 Morse Tamponu:")
+    morse_html = f'<div class="morse-display">{morse if morse else "---"}</div>'
+    st.markdown(morse_html, unsafe_allow_html=True)
+    
+    # Anlık harf
+    if morse:
+        st.markdown(f"#### 🔤 Anlık Çözüm: **{current_char}**")
+    
+    # Mesaj
+    st.markdown("#### 💬 Oluşturulan Mesaj:")
+    text_html = f'<div class="big-text">{text if text else "(Henüz mesaj yok)"}</div>'
+    st.markdown(text_html, unsafe_allow_html=True)
+    
+    # Son olay
     if last_event:
-        st.success(last_event)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.caption("İpucu: Eşikler tutmazsa (yanlış sağ/sol algılıyorsa) sidebar’dan ratio_left / ratio_right ile ayarla.")
-
+        st.info(f"📢 {last_event}")
+    
+    # Yenileme butonu (Streamlit state güncellemesi için)
+    if st.button("🔄 Paneli Yenile", use_container_width=True):
+        st.rerun()
 
 st.markdown("---")
 st.markdown(
     "<div style='text-align:center; color:#64748b;'>"
-    "MORSE-EYE • TÜBİTAK 2204-A Demo • Yerel çalıştırma gizlilik açısından önerilir."
+    "MORSE-EYE • TÜBİTAK 2204-A Demo • Göz takibi ile iletişim sistemi"
     "</div>",
     unsafe_allow_html=True,
 )
