@@ -10,10 +10,10 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode, RT
 import mediapipe as mp
 
 # -----------------------------
-# AYARLAR & SABİTLER
+# AYARLAR
 # -----------------------------
-SMOOTHING_WINDOW = 5
-WINK_DIFF_THRESH = 0.04 
+SMOOTHING_WINDOW = 3  # Daha hızlı tepki için düşürdüm
+WINK_DIFF_THRESH = 0.02 # Eşik çok düşürüldü (Daha kolay algılasın diye)
 
 MORSE_TO_CHAR = {
     ".-": "A", "-...": "B", "-.-.": "C", "-..": "D", ".": "E",
@@ -33,19 +33,14 @@ if "app_state" not in st.session_state:
         "morse": "",
         "text": "",
         "last_char": "",
-        "status": "Hazır",
-        "active": False,
-        "eye_open_ear": 0.30,
-        "eye_closed_ear": 0.15,
+        "status": "Sistem Hazır",
+        "active": True, # VARSAYILAN OLARAK AÇIK
         "threshold": 0.22
     }
 
 STATE = st.session_state.app_state
 LOCK = threading.Lock()
 
-# -----------------------------
-# YARDIMCI FONKSİYONLAR
-# -----------------------------
 def speak_js(text):
     safe_text = text.replace('"', '\\"')
     js = f"""
@@ -82,6 +77,7 @@ class MorseProcessor(VideoProcessorBase):
         self.consecutive_blinks = 0
         self.last_blink_end = 0
         
+        # Göz İndeksleri
         self.LEFT_EYE = [33, 160, 158, 133, 153, 144]
         self.RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
@@ -91,8 +87,7 @@ class MorseProcessor(VideoProcessorBase):
         v2 = np.linalg.norm(coords[2] - coords[4])
         hor = np.linalg.norm(coords[0] - coords[3])
         if hor == 0: return 0
-        ear = (v1 + v2) / (2.0 * hor)
-        return ear
+        return (v1 + v2) / (2.0 * hor)
 
     def process_logic(self, left_ear, right_ear):
         now = time.time()
@@ -100,14 +95,14 @@ class MorseProcessor(VideoProcessorBase):
 
         with LOCK:
             thresh = STATE["threshold"]
-            is_active = STATE["active"]
+            # active kontrolünü kaldırdım, her zaman algılasın
 
         left_closed = left_ear < thresh
         right_closed = right_ear < thresh
         
         action = None
         
-        # ÇİFT KIRPMA (BLINK)
+        # 1. ÇİFT KIRPMA (BLINK) - Komutlar
         if left_closed and right_closed:
             if self.blink_start_time == 0:
                 self.blink_start_time = now
@@ -116,7 +111,7 @@ class MorseProcessor(VideoProcessorBase):
                 duration = now - self.blink_start_time
                 self.blink_start_time = 0
                 
-                if 0.1 < duration < 0.8:
+                if 0.1 < duration < 0.8: # Normal bir kırpma süresi
                     if (now - self.last_blink_end) < 0.8:
                         self.consecutive_blinks += 1
                     else:
@@ -126,31 +121,36 @@ class MorseProcessor(VideoProcessorBase):
                     if self.consecutive_blinks == 2: action = "CONFIRM"
                     elif self.consecutive_blinks == 3: action = "SPACE"
                     elif self.consecutive_blinks == 4: action = "BACKSPACE"
-                    elif self.consecutive_blinks == 5: action = "TOGGLE"
 
-        # TEK KIRPMA (WINK)
-        if is_active and self.blink_start_time == 0 and self.consecutive_blinks == 0:
-            if left_closed and (right_ear - left_ear) > WINK_DIFF_THRESH:
-                action = "DASH"
-                self.wink_cooldown = now + 0.6
-            elif right_closed and (left_ear - right_ear) > WINK_DIFF_THRESH:
-                action = "DOT"
-                self.wink_cooldown = now + 0.6
+        # 2. TEK KIRPMA (WINK) - Mors
+        # Blink sayacı 0 iken ve gözler tamamen kapalı değilken
+        if self.blink_start_time == 0 and self.consecutive_blinks == 0:
+            
+            # SOL GÖZ (Çizgi) -> Sol kapalı, Sağ açık
+            # WINK_DIFF_THRESH çok düşük olduğu için hafif fark yetecek
+            if left_closed and not right_closed:
+                # Ekstra kontrol: Sağ göz eşiğin %10 üzerinde mi?
+                if right_ear > (thresh * 1.1): 
+                    action = "DASH"
+                    self.wink_cooldown = now + 0.5 
+
+            # SAĞ GÖZ (Nokta) -> Sağ kapalı, Sol açık
+            elif right_closed and not left_closed:
+                if left_ear > (thresh * 1.1):
+                    action = "DOT"
+                    self.wink_cooldown = now + 0.5
 
         return action
 
     def recv(self, frame):
         try:
-            # Görüntüyü Al
             img = frame.to_ndarray(format="bgr24")
             h, w, c = img.shape
             img = cv2.flip(img, 1)
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            # MediaPipe İşle
             results = self.face_mesh.process(rgb)
             
-            # Yüz Bulundu mu?
             if results.multi_face_landmarks:
                 lm = results.multi_face_landmarks[0].landmark
                 
@@ -158,74 +158,76 @@ class MorseProcessor(VideoProcessorBase):
                 raw_left_ear = self.get_ear(lm, self.LEFT_EYE, w, h)
                 raw_right_ear = self.get_ear(lm, self.RIGHT_EYE, w, h)
                 
+                # Hafif yumuşatma
                 self.left_history.append(raw_left_ear)
                 self.right_history.append(raw_right_ear)
                 l_ear = np.mean(self.left_history)
                 r_ear = np.mean(self.right_history)
                 
-                # Mantık Çalıştır
                 action = self.process_logic(l_ear, r_ear)
                 
-                # State Güncelle
+                # Eylemleri Kaydet
                 with LOCK:
                     if action == "DOT":
                         STATE["morse"] += "."
-                        STATE["status"] = "Nokta (.) Eklendi"
+                        STATE["status"] = "Nokta (.)"
                     elif action == "DASH":
                         STATE["morse"] += "-"
-                        STATE["status"] = "Çizgi (-) Eklendi"
+                        STATE["status"] = "Cizgi (-)"
                     elif action == "CONFIRM":
                         char = decode_morse(STATE["morse"])
                         if char:
                             STATE["text"] += char
                             STATE["last_char"] = char
                             STATE["morse"] = ""
-                            STATE["status"] = f"Harf Onaylandı: {char}"
+                            STATE["status"] = f"Harf: {char}"
                     elif action == "SPACE":
                         STATE["text"] += " "
-                        STATE["status"] = "Boşluk Eklendi"
+                        STATE["status"] = "Bosluk"
                     elif action == "BACKSPACE":
                         STATE["text"] = STATE["text"][:-1]
                         STATE["morse"] = ""
                         STATE["status"] = "Silindi"
-                    elif action == "TOGGLE":
-                        STATE["active"] = not STATE["active"]
-                        STATE["status"] = "Sistem " + ("AÇIK" if STATE["active"] else "KAPALI")
 
-                # --- GÖRSELLEŞTİRME (ÇİZİMLER) ---
+                # --- GÖRSELLEŞTİRME (EN ÖNEMLİ KISIM) ---
                 thresh = STATE["threshold"]
                 
-                # Göz Çerçeveleri
-                color_l = (0, 255, 0) if l_ear > thresh else (0, 0, 255)
-                color_r = (0, 255, 0) if r_ear > thresh else (0, 0, 255)
+                # Göz Durumuna Göre Renkler
+                # Sol Göz
+                if l_ear < thresh:
+                    cv2.circle(img, (50, 100), 20, (0, 0, 255), -1) # Kırmızı Daire
+                    cv2.putText(img, "KAPALI", (80, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                else:
+                    cv2.circle(img, (50, 100), 10, (0, 255, 0), -1) # Yeşil Daire
+
+                # Sağ Göz
+                if r_ear < thresh:
+                    cv2.circle(img, (w-50, 100), 20, (0, 0, 255), -1)
+                    cv2.putText(img, "KAPALI", (w-180, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                else:
+                    cv2.circle(img, (w-50, 100), 10, (0, 255, 0), -1)
                 
-                # Değerleri Ekrana Yaz
-                cv2.putText(img, f"L: {l_ear:.2f}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_l, 2)
-                cv2.putText(img, f"R: {r_ear:.2f}", (w-180, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_r, 2)
+                # EAR Değerlerini Yaz (Debug için)
+                cv2.putText(img, f"L:{l_ear:.2f}", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                cv2.putText(img, f"R:{r_ear:.2f}", (w-120, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+                # Ortaya Büyükçe Durum ve Mors Yaz
+                if STATE['morse']:
+                    cv2.putText(img, STATE['morse'], (w//2 - 50, h//2), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 4)
                 
-                # Üst Bilgi Paneli
-                cv2.rectangle(img, (0, 0), (w, 50), (30, 30, 30), -1)
-                cv2.putText(img, f"DURUM: {STATE['status']}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-                
-                # Alt Mors Paneli
-                cv2.rectangle(img, (0, h-60), (w, h), (0, 0, 0), -1)
-                cv2.putText(img, f"MORSE: {STATE['morse']}", (10, h-15), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                if action: # Bir eylem olduysa ekranda parlasın
+                    cv2.putText(img, STATE['status'], (w//2 - 100, h - 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
 
             else:
-                # YÜZ BULUNAMADI UYARISI
-                cv2.rectangle(img, (0, 0), (w, h), (0, 0, 0), -1)
                 cv2.putText(img, "YUZ ARANIYOR...", (50, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-                cv2.putText(img, "Kameraya Bakin", (70, h//2 + 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
             return av.VideoFrame.from_ndarray(img, format="bgr24")
         
         except Exception as e:
-            # Hata Olursa Konsola Yaz ama Yayını Kesme
-            print(f"Hata: {e}")
             return frame
 
 # -----------------------------
-# ARAYÜZ (STREAMLIT UI)
+# ARAYÜZ
 # -----------------------------
 st.set_page_config(page_title="MORSE-EYE PRO", page_icon="👁️", layout="wide")
 
@@ -235,19 +237,27 @@ st.markdown("""
     footer {visibility: hidden;}
     #MainMenu {visibility: hidden;}
     header {visibility: hidden;}
-    .morse-text { font-family: monospace; font-size: 30px; color: #d63031; letter-spacing: 5px; }
+    .morse-display { 
+        font-family: monospace; 
+        font-size: 60px; 
+        font-weight: bold; 
+        color: #e74c3c; 
+        text-align: center; 
+        background: #fdf2f2; 
+        border-radius: 10px;
+        padding: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("👁️ MORSE-EYE PRO: Akıllı Göz İletişim Sistemi")
+st.title("👁️ MORSE-EYE: Canlı Test Modu")
 
 col1, col2 = st.columns([1.5, 1])
 
 with col1:
-    st.subheader("📷 Canlı Görüntü")
-    # WebRTC Başlatıcı
+    # WebRTC
     ctx = webrtc_streamer(
-        key="morse-eye-pro",
+        key="morse-test",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
         video_processor_factory=MorseProcessor,
@@ -256,49 +266,32 @@ with col1:
     )
 
 with col2:
-    st.subheader("🎛️ Kontrol ve Kalibrasyon")
+    st.subheader("🎛️ Ayarlar")
     
-    with st.expander("🛠️ Sistem Ayarları & Kalibrasyon", expanded=True):
-        st.info("Kameraya bakın ve gözleriniz açıkken 'Açık Kaydet'e basın.")
-        
-        c1, c2 = st.columns(2)
-        if c1.button("👁️ Gözler AÇIK Kaydet"):
-            STATE["eye_open_ear"] = 0.35 
-            STATE["threshold"] = (STATE["eye_open_ear"] + STATE["eye_closed_ear"]) / 2
-            st.success("Açık Göz Kaydedildi")
-            
-        if c2.button("😌 Gözler KAPALI Kaydet"):
-            STATE["eye_closed_ear"] = 0.15
-            STATE["threshold"] = (STATE["eye_open_ear"] + STATE["eye_closed_ear"]) / 2
-            st.success("Kapalı Göz Kaydedildi")
-            
-        new_thresh = st.slider("Hassasiyet Eşiği", 0.10, 0.40, STATE["threshold"], 0.01)
-        STATE["threshold"] = new_thresh
-
-    st.markdown("---")
-    st.markdown(f"### 📟 Mors Kodu: <span class='morse-text'>{STATE['morse']}</span>", unsafe_allow_html=True)
+    st.info("Eğer kırmızı 'KAPALI' yazısı çıkmıyorsa eşiği artırın.")
     
-    current_char = decode_morse(STATE['morse'])
-    if current_char:
-        st.success(f"🔤 Olası Harf: **{current_char}**")
+    # Eşik Ayarı
+    thresh_val = st.slider("Göz Kapanma Eşiği (Hassasiyet)", 0.10, 0.35, STATE["threshold"], 0.01)
+    STATE["threshold"] = thresh_val
     
-    st.markdown("### 📝 Oluşan Mesaj:")
-    st.text_area("", value=STATE["text"], height=100, disabled=True)
+    st.divider()
     
-    b1, b2, b3 = st.columns(3)
-    if b1.button("🔊 Seslendir"):
-        if STATE["text"]: speak_js(STATE["text"])
+    st.markdown("### 📡 ANLIK MORS KODU")
+    st.markdown(f"<div class='morse-display'>{STATE['morse'] if STATE['morse'] else '---'}</div>", unsafe_allow_html=True)
     
-    if b2.button("⌫ Sil"):
-        STATE["text"] = STATE["text"][:-1]
-        st.rerun()
-        
-    if b3.button("🗑️ Temizle"):
+    st.markdown("### 📝 YAZILAN METİN")
+    st.info(STATE["text"] if STATE["text"] else "Henüz bir şey yazılmadı...")
+    
+    # Butonlar
+    c1, c2 = st.columns(2)
+    if c1.button("🗑️ TEMİZLE"):
         STATE["text"] = ""
         STATE["morse"] = ""
         st.rerun()
+    if c2.button("🔊 OKU"):
+        if STATE["text"]: speak_js(STATE["text"])
 
-# Otomatik yenileme
+# Otomatik Yenileme
 if ctx.state.playing:
     time.sleep(0.5)
     st.rerun()
