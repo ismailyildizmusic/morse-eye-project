@@ -1,6 +1,6 @@
-# MORSE-HAND — El Hareketleri ile Mors Kodu
+# MORSE-HAND v2 — El Hareketleri ile Mors Kodu
 # TÜBİTAK 2204-A Projesi
-# Parmak sayısına göre komut sistemi
+# Daha yavaş ve görünür mesaj paneli
 
 import time
 import threading
@@ -33,12 +33,12 @@ MORSE_TO_CHAR = {
 # KOMUT TANIMLARI
 # -----------------------------
 COMMANDS = {
-    0: {"name": "YUMRUK", "action": "CONFIRM", "desc": "Harfi Onayla", "color": (0, 255, 0)},
-    1: {"name": "1 PARMAK", "action": "DOT", "desc": "Nokta (.)", "color": (255, 165, 0)},
-    2: {"name": "2 PARMAK", "action": "DASH", "desc": "Çizgi (-)", "color": (255, 0, 100)},
-    3: {"name": "3 PARMAK", "action": "SPACE", "desc": "Boşluk", "color": (100, 100, 255)},
-    4: {"name": "4 PARMAK", "action": "BACKSPACE", "desc": "Son Sembolü Sil", "color": (255, 100, 100)},
-    5: {"name": "5 PARMAK", "action": "CLEAR", "desc": "Tümünü Temizle", "color": (200, 200, 200)},
+    0: {"name": "YUMRUK", "action": "CONFIRM", "desc": "Harfi Onayla", "color": (0, 255, 0), "emoji": "✊"},
+    1: {"name": "1 PARMAK", "action": "DOT", "desc": "Nokta (.)", "color": (255, 165, 0), "emoji": "☝️"},
+    2: {"name": "2 PARMAK", "action": "DASH", "desc": "Çizgi (-)", "color": (255, 0, 150), "emoji": "✌️"},
+    3: {"name": "3 PARMAK", "action": "SPACE", "desc": "Boşluk", "color": (100, 150, 255), "emoji": "🤟"},
+    4: {"name": "4 PARMAK", "action": "BACKSPACE", "desc": "Geri Sil", "color": (255, 100, 100), "emoji": "🖖"},
+    5: {"name": "5 PARMAK", "action": "CLEAR", "desc": "Temizle", "color": (200, 200, 200), "emoji": "🖐️"},
 }
 
 # -----------------------------
@@ -53,9 +53,11 @@ if "hand_state" not in st.session_state:
         "gesture_name": "Bekleniyor...",
         "progress": 0.0,
         "active": True,
-        # Ayarlar
-        "hold_time": 0.6,  # Komut için bekleme süresi
-        "cooldown": 0.4,   # Komutlar arası bekleme
+        "last_action_time": 0,
+        # YAVAŞLATILMIŞ SÜRELER
+        "hold_time": 1.2,      # Komut için bekleme (artırıldı)
+        "cooldown": 0.8,       # Komutlar arası bekleme (artırıldı)
+        "confirm_time": 1.5,   # Onaylama için ekstra süre
     }
 
 STATE = st.session_state.hand_state
@@ -75,7 +77,7 @@ def speak_js(text, lang="tr-TR"):
         window.speechSynthesis.cancel();
         let msg = new SpeechSynthesisUtterance("{safe}");
         msg.lang = "{lang}";
-        msg.rate = 0.9;
+        msg.rate = 0.8;
         window.speechSynthesis.speak(msg);
     </script>
     """, height=0)
@@ -95,36 +97,34 @@ class MorseHandProcessor(VideoProcessorBase):
             min_tracking_confidence=0.6
         )
         
-        # Parmak ucu indeksleri
-        self.FINGER_TIPS = [4, 8, 12, 16, 20]  # Başparmak, işaret, orta, yüzük, serçe
-        self.FINGER_PIPS = [3, 6, 10, 14, 18]  # Parmak orta eklemleri
+        # Parmak ucu ve eklem indeksleri
+        self.FINGER_TIPS = [4, 8, 12, 16, 20]
+        self.FINGER_PIPS = [3, 6, 10, 14, 18]
         
         # Zamanlama
         self.gesture_start = 0
         self.current_fingers = -1
         self.last_action_time = 0
-        self.finger_history = deque(maxlen=5)  # Stabilite için
+        self.finger_history = deque(maxlen=7)  # Daha fazla stabilite
+        self.action_executed = False  # Aynı jestte tekrar çalışmasın
         
     def count_fingers(self, hand_landmarks, handedness):
         """Açık parmak sayısını hesapla"""
         landmarks = hand_landmarks.landmark
         fingers_up = []
         
-        # Elin sağ mı sol mu olduğunu kontrol et
         is_right = handedness.classification[0].label == "Right"
         
-        # Başparmak - yatay kontrol (elin yönüne göre)
+        # Başparmak
         thumb_tip = landmarks[self.FINGER_TIPS[0]]
         thumb_ip = landmarks[self.FINGER_PIPS[0]]
         
         if is_right:
-            # Sağ el: başparmak sola açılır (x azalır)
             fingers_up.append(thumb_tip.x < thumb_ip.x)
         else:
-            # Sol el: başparmak sağa açılır (x artar)
             fingers_up.append(thumb_tip.x > thumb_ip.x)
         
-        # Diğer 4 parmak - dikey kontrol (y azalırsa açık)
+        # Diğer 4 parmak
         for i in range(1, 5):
             tip = landmarks[self.FINGER_TIPS[i]]
             pip = landmarks[self.FINGER_PIPS[i]]
@@ -132,60 +132,73 @@ class MorseHandProcessor(VideoProcessorBase):
         
         return sum(fingers_up)
     
-    def get_hand_center(self, hand_landmarks, w, h):
-        """El merkezini hesapla"""
-        landmarks = hand_landmarks.landmark
-        x_coords = [lm.x * w for lm in landmarks]
-        y_coords = [lm.y * h for lm in landmarks]
-        return int(np.mean(x_coords)), int(np.mean(y_coords))
-    
     def process_gesture(self, finger_count):
-        """Parmak sayısına göre komut işle"""
+        """Parmak sayısına göre komut işle - YAVAŞLATILMIŞ"""
         now = time.time()
         
         with LOCK:
             hold_time = STATE["hold_time"]
             cooldown = STATE["cooldown"]
-            active = STATE["active"]
-        
-        if not active:
-            return None, 0.0
+            confirm_time = STATE["confirm_time"]
         
         # Stabilite için geçmiş değerlere bak
         self.finger_history.append(finger_count)
         
-        # Son 5 okumada en sık görülen değer
-        if len(self.finger_history) >= 3:
-            stable_count = max(set(self.finger_history), key=list(self.finger_history).count)
+        if len(self.finger_history) >= 5:
+            # En sık görülen değer
+            counts = {}
+            for f in self.finger_history:
+                counts[f] = counts.get(f, 0) + 1
+            stable_count = max(counts, key=counts.get)
+            
+            # En az 4 kez görülmüş olmalı (daha kararlı)
+            if counts[stable_count] < 4:
+                stable_count = -1
         else:
-            stable_count = finger_count
+            stable_count = -1
         
         # Parmak sayısı değişti mi?
         if stable_count != self.current_fingers:
             self.current_fingers = stable_count
             self.gesture_start = now
+            self.action_executed = False  # Yeni jest, aksiyon sıfırla
             with LOCK:
                 STATE["progress"] = 0.0
             return None, 0.0
         
+        # Geçersiz jest
+        if stable_count == -1:
+            return None, 0.0
+        
         # Ne kadar süredir bu jest?
         held_time = now - self.gesture_start
-        progress = min(1.0, held_time / hold_time)
+        
+        # Onaylama (yumruk) için daha uzun süre
+        required_time = confirm_time if stable_count == 0 else hold_time
+        
+        progress = min(1.0, held_time / required_time)
         
         # Cooldown kontrolü
         if (now - self.last_action_time) < cooldown:
+            with LOCK:
+                STATE["progress"] = progress
+                STATE["finger_count"] = stable_count
+                if stable_count in COMMANDS:
+                    STATE["gesture_name"] = COMMANDS[stable_count]["name"]
             return None, progress
         
-        # Süre doldu mu?
+        # Süre doldu ve aksiyon henüz çalışmadı mı?
         action = None
-        if held_time >= hold_time:
+        if held_time >= required_time and not self.action_executed:
             if stable_count in COMMANDS:
                 action = COMMANDS[stable_count]["action"]
                 self.last_action_time = now
-                self.gesture_start = now  # Sıfırla
+                self.action_executed = True  # Bu jestte bir kez çalıştı
                 
                 # Aksiyonu uygula
                 with LOCK:
+                    STATE["last_action_time"] = now
+                    
                     if action == "DOT":
                         STATE["morse"] += "."
                         STATE["last_event"] = "✓ Nokta (.) eklendi"
@@ -197,12 +210,12 @@ class MorseHandProcessor(VideoProcessorBase):
                             char = decode_morse(STATE["morse"])
                             if char and char != "?":
                                 STATE["text"] += char
-                                STATE["last_event"] = f"✓ Harf: {STATE['morse']} → {char}"
+                                STATE["last_event"] = f"✓ {STATE['morse']} → {char}"
                             else:
                                 STATE["last_event"] = f"✗ Geçersiz: {STATE['morse']}"
                             STATE["morse"] = ""
                         else:
-                            STATE["last_event"] = "Morse tamponu boş"
+                            STATE["last_event"] = "ℹ Morse boş"
                     elif action == "SPACE":
                         if STATE["text"] and not STATE["text"].endswith(" "):
                             STATE["text"] += " "
@@ -210,14 +223,14 @@ class MorseHandProcessor(VideoProcessorBase):
                     elif action == "BACKSPACE":
                         if STATE["morse"]:
                             STATE["morse"] = STATE["morse"][:-1]
-                            STATE["last_event"] = "✓ Son sembol silindi"
+                            STATE["last_event"] = "✓ Sembol silindi"
                         elif STATE["text"]:
                             STATE["text"] = STATE["text"][:-1]
-                            STATE["last_event"] = "✓ Son harf silindi"
+                            STATE["last_event"] = "✓ Harf silindi"
                     elif action == "CLEAR":
                         STATE["morse"] = ""
                         STATE["text"] = ""
-                        STATE["last_event"] = "✓ Tümü temizlendi"
+                        STATE["last_event"] = "✓ Temizlendi"
         
         with LOCK:
             STATE["finger_count"] = stable_count
@@ -228,114 +241,78 @@ class MorseHandProcessor(VideoProcessorBase):
         return action, progress
 
     def draw_ui(self, img, finger_count, progress, hand_landmarks=None):
-        """Ekran üzerine görsel arayüz çiz"""
+        """Basitleştirilmiş ekran arayüzü"""
         h, w = img.shape[:2]
         
         with LOCK:
             morse = STATE["morse"]
-            text = STATE["text"]
-            last_event = STATE["last_event"]
-            active = STATE["active"]
         
-        # === ÜST PANEL - Komut Göstergeleri ===
-        panel_height = 100
-        cv2.rectangle(img, (0, 0), (w, panel_height), (30, 30, 30), -1)
+        # === ÜST PANEL - Sadece aktif komut ===
+        cv2.rectangle(img, (0, 0), (w, 80), (20, 20, 20), -1)
         
-        # 6 komut kutusu
-        box_width = w // 6
-        for i, (count, cmd) in enumerate(COMMANDS.items()):
-            x1 = i * box_width
-            x2 = x1 + box_width - 2
+        if finger_count in COMMANDS:
+            cmd = COMMANDS[finger_count]
             
-            # Aktif komut vurgusu
-            if finger_count == count:
-                # İlerleme çubuğu (alttan yukarı dolan)
-                fill_height = int(60 * progress)
-                cv2.rectangle(img, (x1, 60 - fill_height), (x2, 60), cmd["color"], -1)
-                border_color = (255, 255, 255)
-                text_color = (255, 255, 255)
-            else:
-                border_color = (80, 80, 80)
-                text_color = (150, 150, 150)
+            # İlerleme çubuğu
+            bar_width = int(w * progress)
+            cv2.rectangle(img, (0, 0), (bar_width, 80), cmd["color"], -1)
             
-            # Kutu çerçevesi
-            cv2.rectangle(img, (x1 + 2, 5), (x2, 60), border_color, 2)
+            # Yarı saydam overlay
+            overlay = img.copy()
+            cv2.rectangle(overlay, (0, 0), (bar_width, 80), cmd["color"], -1)
+            cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
             
-            # Parmak sayısı (büyük)
-            num_text = "✊" if count == 0 else str(count)
-            cv2.putText(img, num_text, (x1 + box_width//2 - 15, 45), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 2)
+            # Komut bilgisi
+            text = f"{cmd['emoji']} {cmd['desc']} - %{int(progress*100)}"
+            cv2.putText(img, text, (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+        else:
+            cv2.putText(img, "Elini goster...", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 1, (150, 150, 150), 2)
+        
+        # === ORTA - Büyük Morse Kodu ===
+        morse_display = morse if morse else ""
+        if morse_display:
+            # Arka plan kutusu
+            box_w = min(len(morse_display) * 60 + 40, w - 40)
+            box_x = (w - box_w) // 2
+            cv2.rectangle(img, (box_x, h//2 - 50), (box_x + box_w, h//2 + 50), (0, 0, 0), -1)
+            cv2.rectangle(img, (box_x, h//2 - 50), (box_x + box_w, h//2 + 50), (0, 255, 255), 3)
             
-            # Komut açıklaması
-            cv2.putText(img, cmd["desc"], (x1 + 5, 80), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, text_color, 1)
-        
-        # === ORTA KISIM - Mors ve El ===
-        
-        # Morse kodu (büyük, görünür)
-        morse_display = morse if morse else "---"
-        morse_size = 2.0 if len(morse_display) < 8 else 1.5
-        text_size = cv2.getTextSize(morse_display, cv2.FONT_HERSHEY_SIMPLEX, morse_size, 4)[0]
-        text_x = (w - text_size[0]) // 2
-        
-        # Morse arka planı
-        cv2.rectangle(img, (text_x - 20, 110), (text_x + text_size[0] + 20, 180), (0, 0, 0), -1)
-        cv2.rectangle(img, (text_x - 20, 110), (text_x + text_size[0] + 20, 180), (0, 255, 255), 2)
-        cv2.putText(img, morse_display, (text_x, 165), cv2.FONT_HERSHEY_SIMPLEX, morse_size, (0, 255, 255), 4)
-        
-        # Anlık harf çözümü
-        if morse:
+            # Morse kodu
+            font_size = 2.5 if len(morse_display) < 6 else 1.8
+            text_size = cv2.getTextSize(morse_display, cv2.FONT_HERSHEY_SIMPLEX, font_size, 4)[0]
+            text_x = (w - text_size[0]) // 2
+            cv2.putText(img, morse_display, (text_x, h//2 + 20), cv2.FONT_HERSHEY_SIMPLEX, font_size, (0, 255, 255), 4)
+            
+            # Tahmin edilen harf
             predicted = decode_morse(morse)
             if predicted and predicted != "?":
-                cv2.putText(img, f"= {predicted}", (text_x + text_size[0] + 30, 160), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                cv2.putText(img, f"= {predicted}", (box_x + box_w + 10, h//2 + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
         
-        # El landmark'larını çiz (varsa)
+        # === El çizimi ===
         if hand_landmarks:
             self.mp_draw.draw_landmarks(
                 img, hand_landmarks, 
                 self.mp_hands.HAND_CONNECTIONS,
-                self.mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=3),
+                self.mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=4),
                 self.mp_draw.DrawingSpec(color=(255, 255, 255), thickness=2)
             )
             
-            # El merkezinde parmak sayısı göster
-            cx, cy = self.get_hand_center(hand_landmarks, w, h)
-            cv2.circle(img, (cx, cy), 40, COMMANDS.get(finger_count, {}).get("color", (255,255,255)), 3)
-            cv2.putText(img, str(finger_count), (cx - 15, cy + 15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-        
-        # === ALT PANEL - Mesaj ===
-        cv2.rectangle(img, (0, h-80), (w, h), (20, 20, 20), -1)
-        
-        # Mesaj başlığı
-        cv2.putText(img, "MESAJ:", (15, h-55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
-        
-        # Mesaj metni
-        display_text = text[-50:] if len(text) > 50 else text
-        if not display_text:
-            display_text = "(El hareketleriyle mesaj yazın...)"
-            text_color = (100, 100, 100)
-        else:
-            text_color = (255, 255, 255)
-        cv2.putText(img, display_text, (15, h-25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
-        
-        # Son olay (sağ altta)
-        if last_event:
-            event_color = (100, 255, 100) if "✓" in last_event else (255, 100, 100)
-            cv2.putText(img, last_event, (w - 350, h-25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, event_color, 1)
-        
-        # Sistem durumu (sol üst köşe)
-        status_text = "AKTIF" if active else "PASIF"
-        status_color = (0, 255, 0) if active else (0, 0, 255)
-        cv2.circle(img, (w - 30, 25), 10, status_color, -1)
+            # Parmak sayısı göster (el üzerinde)
+            wrist = hand_landmarks.landmark[0]
+            cx, cy = int(wrist.x * w), int(wrist.y * h) - 60
+            if 0 < cy < h and 0 < cx < w:
+                cv2.circle(img, (cx, cy), 35, (0, 0, 0), -1)
+                cv2.circle(img, (cx, cy), 35, (0, 255, 255), 3)
+                cv2.putText(img, str(finger_count), (cx - 12, cy + 12), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
         
         return img
 
     def recv(self, frame):
         try:
             img = frame.to_ndarray(format="bgr24")
-            img = cv2.flip(img, 1)  # Ayna görüntüsü
+            img = cv2.flip(img, 1)
             h, w = img.shape[:2]
             
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -348,29 +325,18 @@ class MorseHandProcessor(VideoProcessorBase):
             if results.multi_hand_landmarks and results.multi_handedness:
                 hand_landmarks = results.multi_hand_landmarks[0]
                 handedness = results.multi_handedness[0]
-                
-                # Parmak say
                 finger_count = self.count_fingers(hand_landmarks, handedness)
-                
-                # Jest işle
                 action, progress = self.process_gesture(finger_count)
             else:
-                # El bulunamadı - state sıfırla
                 self.current_fingers = -1
                 self.finger_history.clear()
+                self.action_executed = False
                 with LOCK:
                     STATE["finger_count"] = -1
-                    STATE["gesture_name"] = "El bulunamadı"
+                    STATE["gesture_name"] = "El yok"
                     STATE["progress"] = 0.0
             
-            # Arayüzü çiz
             img = self.draw_ui(img, finger_count, progress, hand_landmarks)
-            
-            # El bulunamadı uyarısı
-            if finger_count == -1:
-                cv2.rectangle(img, (w//2-120, h//2-20), (w//2+120, h//2+20), (0, 0, 180), -1)
-                cv2.putText(img, "ELINI GOSTER", (w//2-100, h//2+10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
             
             return av.VideoFrame.from_ndarray(img, format="bgr24")
             
@@ -390,85 +356,100 @@ st.markdown("""
     footer {visibility: hidden;}
     #MainMenu {visibility: hidden;}
     
-    .main-title {
+    .big-title {
         text-align: center;
-        background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
-        padding: 20px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 15px;
         border-radius: 15px;
         color: white;
-        margin-bottom: 20px;
+        margin-bottom: 15px;
     }
     
-    .morse-box {
+    .morse-display {
         font-family: 'Courier New', monospace;
-        font-size: 52px;
+        font-size: 72px;
         font-weight: bold;
         color: #00ffcc;
         text-align: center;
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        padding: 25px;
-        border-radius: 15px;
-        border: 3px solid #00ffcc;
-        margin: 10px 0;
-        min-height: 90px;
-        text-shadow: 0 0 20px #00ffcc;
-    }
-    
-    .text-box {
-        font-size: 26px;
-        color: #ffffff;
-        background: linear-gradient(135deg, #232526 0%, #414345 100%);
-        padding: 20px;
-        border-radius: 15px;
-        border: 2px solid #555;
-        min-height: 100px;
-        margin: 10px 0;
-    }
-    
-    .command-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 10px;
+        background: #0a0a0a;
+        padding: 30px;
+        border-radius: 20px;
+        border: 4px solid #00ffcc;
         margin: 15px 0;
+        min-height: 120px;
+        text-shadow: 0 0 30px #00ffcc;
+        letter-spacing: 15px;
     }
     
-    .command-card {
+    .message-display {
+        font-size: 36px;
+        font-weight: bold;
+        color: #ffffff;
+        text-align: center;
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        padding: 30px;
+        border-radius: 20px;
+        border: 3px solid #4a90d9;
+        min-height: 100px;
+        margin: 15px 0;
+        word-wrap: break-word;
+    }
+    
+    .predicted-char {
+        font-size: 48px;
+        font-weight: bold;
+        color: #00ff88;
+        text-align: center;
+        padding: 10px;
+    }
+    
+    .command-btn {
         background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-        padding: 15px;
-        border-radius: 12px;
+        padding: 12px;
+        border-radius: 10px;
         text-align: center;
         color: white;
-        border: 2px solid #4a90d9;
+        margin: 3px;
     }
     
-    .command-card h3 {
-        margin: 0;
-        font-size: 32px;
+    .status-box {
+        background: #1a1a2e;
+        padding: 15px;
+        border-radius: 10px;
+        text-align: center;
+        margin: 10px 0;
     }
     
-    .command-card p {
-        margin: 5px 0 0 0;
-        font-size: 14px;
-        opacity: 0.9;
+    .progress-bar {
+        height: 30px;
+        background: #333;
+        border-radius: 15px;
+        overflow: hidden;
+        margin: 10px 0;
+    }
+    
+    .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #00ff88, #00ccff);
+        transition: width 0.1s;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # Başlık
 st.markdown("""
-<div class="main-title">
-    <h1>✋ MORSE-HAND</h1>
-    <p>El Hareketleri ile Mors Kodu İletişim Sistemi | TÜBİTAK 2204-A</p>
+<div class="big-title">
+    <h1 style="margin:0;">✋ MORSE-HAND</h1>
+    <p style="margin:5px 0 0 0;">El Hareketleri ile Mors Kodu | TÜBİTAK 2204-A</p>
 </div>
 """, unsafe_allow_html=True)
 
-# Ana düzen
-col_video, col_panel = st.columns([1.5, 1])
+# Ana düzen - Video solda, panel sağda
+col_video, col_panel = st.columns([1.2, 1])
 
 with col_video:
-    # WebRTC kamera
-    webrtc_streamer(
-        key="morse-hand",
+    webrtc_ctx = webrtc_streamer(
+        key="morse-hand-v2",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTCConfiguration({
             "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
@@ -477,152 +458,139 @@ with col_video:
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
-    
-    # Komut rehberi
-    st.markdown("""
-    <div class="command-grid">
-        <div class="command-card" style="background: linear-gradient(135deg, #f5af19 0%, #f12711 100%);">
-            <h3>☝️ 1</h3>
-            <p>NOKTA (.)</p>
-        </div>
-        <div class="command-card" style="background: linear-gradient(135deg, #ee0979 0%, #ff6a00 100%);">
-            <h3>✌️ 2</h3>
-            <p>ÇİZGİ (-)</p>
-        </div>
-        <div class="command-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);">
-            <h3>✊ 0</h3>
-            <p>ONAYLA</p>
-        </div>
-        <div class="command-card" style="background: linear-gradient(135deg, #4776E6 0%, #8E54E9 100%);">
-            <h3>🤟 3</h3>
-            <p>BOŞLUK</p>
-        </div>
-        <div class="command-card" style="background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);">
-            <h3>🖖 4</h3>
-            <p>GERİ SİL</p>
-        </div>
-        <div class="command-card" style="background: linear-gradient(135deg, #525252 0%, #3d3d3d 100%);">
-            <h3>🖐️ 5</h3>
-            <p>TEMİZLE</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
 
 with col_panel:
-    st.subheader("📟 Mors Kodu")
-    morse_display = STATE["morse"] if STATE["morse"] else "---"
-    st.markdown(f'<div class="morse-box">{morse_display}</div>', unsafe_allow_html=True)
+    # === MORS KODU (BÜYÜK) ===
+    st.markdown("### 📟 MORS KODU")
+    morse_val = STATE["morse"] if STATE["morse"] else "---"
+    st.markdown(f'<div class="morse-display">{morse_val}</div>', unsafe_allow_html=True)
     
-    # Anlık çözüm
+    # Tahmin edilen harf
     if STATE["morse"]:
         predicted = decode_morse(STATE["morse"])
-        if predicted != "?":
-            st.success(f"🔤 Tahmin: **{predicted}**")
+        if predicted and predicted != "?":
+            st.markdown(f'<div class="predicted-char">Harf: {predicted}</div>', unsafe_allow_html=True)
         else:
-            st.warning("❓ Geçersiz kod")
+            st.warning("❓ Geçersiz mors kodu")
     
-    st.subheader("💬 Mesaj")
-    text_display = STATE["text"] if STATE["text"] else "(Henüz mesaj yok)"
-    st.markdown(f'<div class="text-box">{text_display}</div>', unsafe_allow_html=True)
+    # === MESAJ (BÜYÜK) ===
+    st.markdown("### 💬 MESAJ")
+    msg_val = STATE["text"] if STATE["text"] else "(Mesajınız burada görünecek)"
+    st.markdown(f'<div class="message-display">{msg_val}</div>', unsafe_allow_html=True)
     
-    # Durum göstergesi
+    # === İLERLEME ÇUBUĞU ===
+    progress_pct = int(STATE["progress"] * 100)
+    st.markdown(f"""
+    <div class="progress-bar">
+        <div class="progress-fill" style="width: {progress_pct}%;"></div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Durum bilgisi
     col_s1, col_s2 = st.columns(2)
     with col_s1:
-        finger_text = STATE["gesture_name"]
-        st.info(f"🤚 **{finger_text}**")
+        gesture = STATE["gesture_name"]
+        st.info(f"🤚 {gesture}")
     with col_s2:
-        progress_pct = int(STATE["progress"] * 100)
-        st.metric("İlerleme", f"%{progress_pct}")
+        st.info(f"📊 %{progress_pct}")
     
-    # Kontrol butonları
-    st.subheader("🎮 Kontroller")
-    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    # Son olay
+    if STATE["last_event"]:
+        if "✓" in STATE["last_event"]:
+            st.success(STATE["last_event"])
+        elif "✗" in STATE["last_event"]:
+            st.error(STATE["last_event"])
+        else:
+            st.info(STATE["last_event"])
     
-    with btn_col1:
-        if st.button("🗑️ Temizle", use_container_width=True):
+    # === BUTONLAR ===
+    st.markdown("### 🎮 Kontroller")
+    btn1, btn2, btn3 = st.columns(3)
+    
+    with btn1:
+        if st.button("🗑️ TEMİZLE", use_container_width=True):
             STATE["text"] = ""
             STATE["morse"] = ""
-            STATE["last_event"] = "Temizlendi"
+            STATE["last_event"] = "✓ Temizlendi"
             st.rerun()
     
-    with btn_col2:
-        if st.button("↩️ Geri", use_container_width=True):
+    with btn2:
+        if st.button("↩️ GERİ", use_container_width=True):
             if STATE["morse"]:
                 STATE["morse"] = STATE["morse"][:-1]
             elif STATE["text"]:
                 STATE["text"] = STATE["text"][:-1]
+            STATE["last_event"] = "✓ Silindi"
             st.rerun()
     
-    with btn_col3:
-        if st.button("🔊 Oku", use_container_width=True):
+    with btn3:
+        if st.button("🔊 OKU", use_container_width=True):
             if STATE["text"]:
                 speak_js(STATE["text"])
+                st.success("Okunuyor...")
     
-    # Ayarlar
-    with st.expander("⚙️ Ayarlar"):
+    # Yenile butonu
+    if st.button("🔄 PANELİ YENİLE", use_container_width=True, type="primary"):
+        st.rerun()
+
+# === KOMUT REHBERİ (ALT KISIM) ===
+st.markdown("---")
+st.markdown("### 📖 KOMUT REHBERİ")
+
+cmd_cols = st.columns(6)
+for i, (count, cmd) in enumerate(COMMANDS.items()):
+    with cmd_cols[i]:
+        st.markdown(f"""
+        <div class="command-btn">
+            <div style="font-size: 32px;">{cmd['emoji']}</div>
+            <div style="font-size: 14px; font-weight: bold;">{cmd['desc']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# Ayarlar
+with st.expander("⚙️ Hız Ayarları"):
+    col_set1, col_set2 = st.columns(2)
+    with col_set1:
         STATE["hold_time"] = st.slider(
             "Komut süresi (saniye)", 
-            0.3, 1.5, STATE["hold_time"], 0.1,
+            0.5, 2.5, STATE["hold_time"], 0.1,
             help="Parmağı bu kadar süre tutunca komut çalışır"
         )
-        
+    with col_set2:
         STATE["cooldown"] = st.slider(
             "Bekleme süresi (saniye)", 
-            0.2, 1.0, STATE["cooldown"], 0.1,
+            0.3, 1.5, STATE["cooldown"], 0.1,
             help="Komutlar arası minimum bekleme"
         )
     
-    # Morse tablosu
-    with st.expander("📖 Morse Alfabesi"):
-        col_m1, col_m2, col_m3 = st.columns(3)
-        with col_m1:
-            st.markdown("""
-            **A** .-  
-            **B** -...  
-            **C** -.-.  
-            **D** -..  
-            **E** .  
-            **F** ..-.  
-            **G** --.  
-            **H** ....  
-            **I** ..  
-            """)
-        with col_m2:
-            st.markdown("""
-            **J** .---  
-            **K** -.-  
-            **L** .-..  
-            **M** --  
-            **N** -.  
-            **O** ---  
-            **P** .--.  
-            **Q** --.-  
-            **R** .-.  
-            """)
-        with col_m3:
-            st.markdown("""
-            **S** ...  
-            **T** -  
-            **U** ..-  
-            **V** ...-  
-            **W** .--  
-            **X** -..-  
-            **Y** -.--  
-            **Z** --..  
-            """)
+    STATE["confirm_time"] = st.slider(
+        "Onaylama süresi (yumruk)", 
+        1.0, 3.0, STATE["confirm_time"], 0.1,
+        help="Harfi onaylamak için yumruğu tutma süresi"
+    )
 
-# Son olay
-if STATE["last_event"]:
-    if "✓" in STATE["last_event"]:
-        st.success(STATE["last_event"])
-    elif "✗" in STATE["last_event"]:
-        st.error(STATE["last_event"])
+# Morse tablosu
+with st.expander("📖 Morse Alfabesi Tablosu"):
+    morse_cols = st.columns(4)
+    letters = list(MORSE_TO_CHAR.items())[:26]  # Sadece harfler
+    per_col = 7
+    
+    for i, col in enumerate(morse_cols):
+        with col:
+            start = i * per_col
+            end = start + per_col
+            for code, char in letters[start:end]:
+                st.write(f"**{char}** → `{code}`")
 
 # Alt bilgi
 st.markdown("---")
 st.markdown("""
-<div style="text-align: center; color: #888;">
-    <p>✋ <b>MORSE-HAND</b> | TÜBİTAK 2204-A Projesi</p>
-    <p>Hareket kısıtlılığı olan bireyler için el hareketi ile iletişim sistemi</p>
+<div style="text-align: center; color: #888; padding: 10px;">
+    ✋ <b>MORSE-HAND v2</b> | TÜBİTAK 2204-A | El hareketleri ile iletişim sistemi
 </div>
 """, unsafe_allow_html=True)
+
+# Otomatik yenileme (video çalışırken)
+if webrtc_ctx.state.playing:
+    time.sleep(1)
+    st.rerun()
